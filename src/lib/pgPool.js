@@ -34,17 +34,31 @@ export async function getClient() {
   return p.connect();
 }
 
-let initialized = false;
+let initPromise = null;
 
 export async function initSchema() {
-  if (initialized) return;
+  if (initPromise) return initPromise;
 
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = path.dirname(__filename);
-  const schemaPath = path.join(__dirname, "schema.sql");
-  const schemaSql = fs.readFileSync(schemaPath, "utf-8");
+  initPromise = (async () => {
+    const client = await getClient();
+    try {
+      const __filename = fileURLToPath(import.meta.url);
+      const __dirname = path.dirname(__filename);
+      const schemaPath = path.join(__dirname, "schema.sql");
+      const schemaSql = fs.readFileSync(schemaPath, "utf-8");
 
-  await query(schemaSql);
-  initialized = true;
-  console.log("[PG] Schema initialized");
+      await client.query("BEGIN");
+      await client.query(schemaSql);
+      await client.query("COMMIT");
+      console.log("[PG] Schema initialized");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      initPromise = null;
+      throw err;
+    } finally {
+      client.release();
+    }
+  })();
+
+  return initPromise;
 }

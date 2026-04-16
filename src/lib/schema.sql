@@ -221,12 +221,21 @@ CREATE TABLE IF NOT EXISTS agent_daily_summary (
   PRIMARY KEY (date, project_id, agent_name)
 );
 
--- Project-level API keys — isolated per project
-ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id);
+-- Add columns to existing tables (safe idempotent migration)
+DO $$ BEGIN
+  ALTER TABLE api_keys ADD COLUMN project_id UUID REFERENCES projects(id);
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
 
--- Add agent_name + project_id to usage_history for tracking
-ALTER TABLE usage_history ADD COLUMN IF NOT EXISTS agent_name VARCHAR(100);
-ALTER TABLE usage_history ADD COLUMN IF NOT EXISTS project_id UUID;
+DO $$ BEGIN
+  ALTER TABLE usage_history ADD COLUMN agent_name VARCHAR(100);
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE usage_history ADD COLUMN project_id UUID;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
 
 -- Indexes for new tables
 CREATE INDEX IF NOT EXISTS idx_agent_configs_project ON agent_configs(project_id);
