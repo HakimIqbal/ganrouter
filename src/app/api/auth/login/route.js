@@ -32,8 +32,13 @@ export async function POST(request) {
     if (storedHash) {
       isValid = await bcrypt.compare(password, storedHash);
     } else {
-      // Use env var or default
-      const initialPassword = process.env.INITIAL_PASSWORD || "123456";
+      const initialPassword = process.env.INITIAL_PASSWORD;
+      if (!initialPassword) {
+        return NextResponse.json(
+          { error: "INITIAL_PASSWORD env var must be set before first login" },
+          { status: 503 }
+        );
+      }
       isValid = password === initialPassword;
     }
 

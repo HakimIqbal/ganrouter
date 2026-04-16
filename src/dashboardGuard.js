@@ -6,18 +6,26 @@ const SECRET = new TextEncoder().encode(
   process.env.JWT_SECRET || "ganrouter-default-secret-change-me"
 );
 
+// Public routes — no auth needed
+const PUBLIC_PATHS = [
+  "/api/auth/login",
+  "/api/health",
+  "/api/locale",
+  "/api/version",
+  "/api/settings/require-login",
+  "/login",
+  "/landing",
+];
+
+// Routes that authenticate via Bearer API key (not JWT)
+const API_KEY_AUTH_PATHS = [
+  "/api/v1/",
+];
+
 // Always require JWT token regardless of requireLogin setting
 const ALWAYS_PROTECTED = [
   "/api/shutdown",
   "/api/settings/database",
-];
-
-// Require auth, but allow through if requireLogin is disabled
-const PROTECTED_API_PATHS = [
-  "/api/settings",
-  "/api/keys",
-  "/api/providers/client",
-  "/api/provider-nodes/validate",
 ];
 
 function isLocalRequest(request) {
@@ -47,81 +55,76 @@ async function loadSettings() {
 }
 
 async function isAuthenticated(request) {
-  if (await hasValidToken(request)) return true;
-  const settings = await loadSettings();
-  if (settings && settings.requireLogin === false) return true;
-  return false;
+  return await hasValidToken(request);
 }
 
 export async function proxy(request) {
   const { pathname } = request.nextUrl;
   const isLocal = isLocalRequest(request);
 
-  // Always protected - allow localhost or valid JWT only
+  // Public paths — no auth needed
+  if (PUBLIC_PATHS.some((p) => pathname.startsWith(p))) {
+    return NextResponse.next();
+  }
+
+  // API key auth paths (/api/v1/*) — authenticated via Bearer token in route handlers
+  if (API_KEY_AUTH_PATHS.some((p) => pathname.startsWith(p))) {
+    return NextResponse.next();
+  }
+
+  // Always protected — require JWT or localhost, never bypass
   if (ALWAYS_PROTECTED.some((p) => pathname.startsWith(p))) {
     if (isLocal || await hasValidToken(request))
       return NextResponse.next();
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  // Protect sensitive API endpoints (bypass if localhost or requireLogin = false)
-  if (PROTECTED_API_PATHS.some((p) => pathname.startsWith(p))) {
-    if (pathname === "/api/settings/require-login") return NextResponse.next();
-    if (isLocal || await isAuthenticated(request))
-      return NextResponse.next();
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  // Static assets and non-API paths (CSS, JS, images, _next)
+  if (!pathname.startsWith("/api/") && !pathname.startsWith("/dashboard")) {
+    if (pathname === "/") {
+      return NextResponse.redirect(new URL("/dashboard", request.url));
+    }
+    return NextResponse.next();
   }
 
-  // Protect all dashboard routes
-  if (pathname.startsWith("/dashboard")) {
-    let requireLogin = true;
-    let tunnelDashboardAccess = true;
-
-    try {
-      const settings = await loadSettings();
-      if (settings) {
-        requireLogin = settings.requireLogin !== false;
-        tunnelDashboardAccess = settings.tunnelDashboardAccess === true;
-
-        // Block tunnel/tailscale access if disabled (redirect to login)
-        if (!tunnelDashboardAccess) {
-          const host = (request.headers.get("host") || "").split(":")[0].toLowerCase();
-          const tunnelHost = settings.tunnelUrl ? new URL(settings.tunnelUrl).hostname.toLowerCase() : "";
-          const tailscaleHost = settings.tailscaleUrl ? new URL(settings.tailscaleUrl).hostname.toLowerCase() : "";
-          if ((tunnelHost && host === tunnelHost) || (tailscaleHost && host === tailscaleHost)) {
-            return NextResponse.redirect(new URL("/login", request.url));
+  // ALL remaining /api/* and /dashboard/* routes — require auth
+  let tunnelDashboardAccess = true;
+  try {
+    const settings = await loadSettings();
+    if (settings) {
+      tunnelDashboardAccess = settings.tunnelDashboardAccess === true;
+      if (!tunnelDashboardAccess) {
+        const host = (request.headers.get("host") || "").split(":")[0].toLowerCase();
+        const tunnelHost = settings.tunnelUrl ? new URL(settings.tunnelUrl).hostname.toLowerCase() : "";
+        const tailscaleHost = settings.tailscaleUrl ? new URL(settings.tailscaleUrl).hostname.toLowerCase() : "";
+        if ((tunnelHost && host === tunnelHost) || (tailscaleHost && host === tailscaleHost)) {
+          if (pathname.startsWith("/api/")) {
+            return NextResponse.json({ error: "Tunnel access disabled" }, { status: 403 });
           }
+          return NextResponse.redirect(new URL("/login", request.url));
         }
       }
-    } catch {
-      // On error, keep defaults (require login, block tunnel)
     }
-
-    // If login not required, allow through
-    if (!requireLogin) return NextResponse.next();
-
-    // Verify JWT token
-    const token = request.cookies.get("auth_token")?.value;
-    if (token) {
-      try {
-        await jwtVerify(token, SECRET);
-        return NextResponse.next();
-      } catch {
-        return NextResponse.redirect(new URL("/login", request.url));
-      }
-    }
-
-    return NextResponse.redirect(new URL("/login", request.url));
+  } catch {
+    // On error, require auth (fail-closed)
   }
 
-  // Redirect / to /dashboard if logged in, or /dashboard if it's the root
-  if (pathname === "/") {
-    return NextResponse.redirect(new URL("/dashboard", request.url));
+  // Allow if localhost or has valid JWT
+  if (isLocal || await hasValidToken(request)) {
+    return NextResponse.next();
   }
 
-  return NextResponse.next();
+  // Not authenticated — reject
+  if (pathname.startsWith("/api/")) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  return NextResponse.redirect(new URL("/login", request.url));
 }
 
 export const config = {
-  matcher: ["/", "/dashboard/:path*"],
+  matcher: [
+    "/",
+    "/dashboard/:path*",
+    "/api/:path*",
+  ],
 };
