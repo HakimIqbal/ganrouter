@@ -10,7 +10,7 @@ const DEFAULT_MITM_ROUTER_BASE = "http://localhost:20128";
 const isCloud = typeof caches !== 'undefined' || typeof caches === 'object';
 
 function getAppName() {
-  return "9router";
+  return "ganrouter";
 }
 
 function getUserDataDir() {

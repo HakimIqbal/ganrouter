@@ -1,4 +1,4 @@
-docker stop 9router
-docker rm 9router
-docker build -t 9router .
-docker run -d --name 9router -p 20128:20128 --env-file .env -v 9router-data:/app/data 9router
+docker stop ganrouter
+docker rm ganrouter
+docker build -t ganrouter .
+docker run -d --name ganrouter -p 20128:20128 --env-file .env -v ganrouter-data:/app/data ganrouter

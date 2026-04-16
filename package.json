@@ -1,7 +1,7 @@
 {
-  "name": "9router-app",
+  "name": "ganrouter-app",
   "version": "0.3.91",
-  "description": "9Router web dashboard",
+  "description": "GaNRouter web dashboard",
   "private": true,
   "scripts": {
     "dev": "next dev --webpack --port 20128",
