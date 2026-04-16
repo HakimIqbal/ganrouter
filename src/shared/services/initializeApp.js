@@ -58,18 +58,6 @@ const NETWORK_RESTART_COOLDOWN_MS = 30000;
  */
 export async function initializeApp() {
   try {
-    // Security: warn if using default/weak secrets
-    const jwtSecret = process.env.JWT_SECRET || "";
-    if (!jwtSecret || jwtSecret.includes("change-me") || jwtSecret.length < 32) {
-      console.warn("[Security] WARNING: JWT_SECRET is weak or default. Set a strong random string (32+ chars) in .env");
-    }
-    if (!process.env.INITIAL_PASSWORD || process.env.INITIAL_PASSWORD.includes("change-me")) {
-      console.warn("[Security] WARNING: INITIAL_PASSWORD not set or still default. Set a strong password in .env");
-    }
-    if (process.env.API_KEY_SECRET === "endpoint-proxy-api-key-secret") {
-      console.warn("[Security] WARNING: API_KEY_SECRET is still the default value. Change it in .env");
-    }
-
     await cleanupProviderConnections();
 
     // Auto-reconnect tunnel if it was enabled before restart

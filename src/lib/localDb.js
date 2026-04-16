@@ -1,7 +1,38 @@
-import { query, getClient, initSchema } from "@/lib/pgPool.js";
+import { Low } from "lowdb";
+import { JSONFile } from "lowdb/node";
 import { v4 as uuidv4 } from "uuid";
+import path from "node:path";
+import os from "node:os";
+import fs from "node:fs";
+import lockfile from "proper-lockfile";
 
 const DEFAULT_MITM_ROUTER_BASE = "http://localhost:20128";
+const isCloud = typeof caches !== 'undefined' || typeof caches === 'object';
+
+function getAppName() {
+  return "ganrouter";
+}
+
+function getUserDataDir() {
+  if (isCloud) return "/tmp";
+  if (process.env.DATA_DIR) return process.env.DATA_DIR;
+
+  const platform = process.platform;
+  const homeDir = os.homedir();
+  const appName = getAppName();
+
+  if (platform === "win32") {
+    return path.join(process.env.APPDATA || path.join(homeDir, "AppData", "Roaming"), appName);
+  }
+  return path.join(homeDir, `.${appName}`);
+}
+
+const DATA_DIR = getUserDataDir();
+const DB_FILE = isCloud ? null : path.join(DATA_DIR, "db.json");
+
+if (!isCloud && !fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
 const DEFAULT_SETTINGS = {
   cloudEnabled: false,
@@ -27,708 +58,693 @@ const DEFAULT_SETTINGS = {
   mitmRouterBaseUrl: DEFAULT_MITM_ROUTER_BASE,
 };
 
-// ── helpers ──────────────────────────────────────────────────────────
-
-function snakeToCamel(str) {
-  return str.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+function cloneDefaultData() {
+  return {
+    providerConnections: [],
+    providerNodes: [],
+    proxyPools: [],
+    modelAliases: {},
+    mitmAlias: {},
+    combos: [],
+    apiKeys: [],
+    settings: { ...DEFAULT_SETTINGS },
+    pricing: {},
+  };
 }
 
-function camelToSnake(str) {
-  return str.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+if (!isCloud && DB_FILE && !fs.existsSync(DB_FILE)) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(cloneDefaultData(), null, 2));
 }
 
-function rowToCamel(row) {
-  if (!row) return null;
-  const out = {};
-  for (const [k, v] of Object.entries(row)) {
-    out[snakeToCamel(k)] = v;
+function ensureDbShape(data) {
+  const defaults = cloneDefaultData();
+  const next = data && typeof data === "object" ? data : {};
+  let changed = false;
+
+  for (const [key, defaultValue] of Object.entries(defaults)) {
+    if (next[key] === undefined || next[key] === null) {
+      next[key] = defaultValue;
+      changed = true;
+      continue;
+    }
+
+    if (key === "settings" && (typeof next.settings !== "object" || Array.isArray(next.settings))) {
+      next.settings = { ...defaultValue };
+      changed = true;
+      continue;
+    }
+
+    if (key === "settings" && typeof next.settings === "object" && !Array.isArray(next.settings)) {
+      for (const [settingKey, settingDefault] of Object.entries(defaultValue)) {
+        if (next.settings[settingKey] === undefined) {
+          // Backward-compat: if proxy URL was saved, default outboundProxyEnabled to true
+          if (
+            settingKey === "outboundProxyEnabled" &&
+            typeof next.settings.outboundProxyUrl === "string" &&
+            next.settings.outboundProxyUrl.trim()
+          ) {
+            next.settings.outboundProxyEnabled = true;
+          } else {
+            next.settings[settingKey] = settingDefault;
+          }
+          changed = true;
+        }
+      }
+    }
+
+    // Migrate existing API keys to have isActive
+    if (key === "apiKeys" && Array.isArray(next.apiKeys)) {
+      for (const apiKey of next.apiKeys) {
+        if (apiKey.isActive === undefined || apiKey.isActive === null) {
+          apiKey.isActive = true;
+          changed = true;
+        }
+      }
+    }
   }
-  return out;
+
+  return { data: next, changed };
 }
 
-function rowsToCamel(rows) {
-  return rows.map(rowToCamel);
+let dbInstance = null;
+
+const LOCK_OPTIONS = {
+  retries: { retries: 15, minTimeout: 50, maxTimeout: 3000 },
+  stale: 10000,
+};
+
+class LocalMutex {
+  constructor() {
+    this._queue = [];
+    this._locked = false;
+  }
+
+  async acquire() {
+    if (!this._locked) {
+      this._locked = true;
+      return () => this._release();
+    }
+    return new Promise((resolve) => {
+      this._queue.push(resolve);
+    }).then(() => () => this._release());
+  }
+
+  _release() {
+    const next = this._queue.shift();
+    if (next) next();
+    else this._locked = false;
+  }
 }
 
-// ── getDb (compatibility wrapper) ────────────────────────────────────
+const localMutex = new LocalMutex();
 
-let schemaReady = false;
+async function withFileLock(db, operation) {
+  if (isCloud) {
+    await operation();
+    return;
+  }
+
+  const releaseLocal = await localMutex.acquire();
+  let release = null;
+  try {
+    release = await lockfile.lock(DB_FILE, LOCK_OPTIONS);
+    await operation();
+  } catch (error) {
+    if (error.code === "ELOCKED") {
+      console.warn(`[DB] File is locked, retrying...`);
+    }
+    throw error;
+  } finally {
+    if (release) {
+      try { await release(); } catch (_) { }
+    }
+    releaseLocal();
+  }
+}
+
+async function safeRead(db) {
+  await withFileLock(db, () => db.read());
+}
+
+async function safeWrite(db) {
+  await withFileLock(db, () => db.write());
+}
 
 export async function getDb() {
-  if (!schemaReady) {
-    await initSchema();
-    schemaReady = true;
+  if (isCloud) {
+    if (!dbInstance) {
+      const data = cloneDefaultData();
+      dbInstance = new Low({ read: async () => { }, write: async () => { } }, data);
+      dbInstance.data = data;
+    }
+    return dbInstance;
   }
-  // Return a thin compatibility wrapper so callers that do `const db = await getDb()` don't crash.
-  return { data: null };
-}
 
-// ensure schema is ready before any query
-async function ensureSchema() {
-  if (!schemaReady) {
-    await initSchema();
-    schemaReady = true;
+  if (!dbInstance) {
+    dbInstance = new Low(new JSONFile(DB_FILE), cloneDefaultData());
   }
-}
 
-// ── Provider Connections ─────────────────────────────────────────────
+  try {
+    await safeRead(dbInstance);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      console.warn('[DB] Corrupt JSON detected, resetting to defaults...');
+      dbInstance.data = cloneDefaultData();
+      await safeWrite(dbInstance);
+    } else {
+      throw error;
+    }
+  }
+
+  if (!dbInstance.data) {
+    dbInstance.data = cloneDefaultData();
+    await safeWrite(dbInstance);
+  } else {
+    const { data, changed } = ensureDbShape(dbInstance.data);
+    dbInstance.data = data;
+    if (changed) await safeWrite(dbInstance);
+  }
+
+  return dbInstance;
+}
 
 export async function getProviderConnections(filter = {}) {
-  await ensureSchema();
-  const conditions = [];
-  const params = [];
-  let idx = 1;
+  const db = await getDb();
+  let connections = db.data.providerConnections || [];
 
-  if (filter.provider) {
-    conditions.push(`provider = $${idx++}`);
-    params.push(filter.provider);
-  }
-  if (filter.isActive !== undefined) {
-    conditions.push(`is_active = $${idx++}`);
-    params.push(filter.isActive);
-  }
+  if (filter.provider) connections = connections.filter(c => c.provider === filter.provider);
+  if (filter.isActive !== undefined) connections = connections.filter(c => c.isActive === filter.isActive);
 
-  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  const { rows } = await query(
-    `SELECT * FROM provider_connections ${where} ORDER BY priority ASC NULLS LAST`,
-    params
+  connections.sort((a, b) => (a.priority || 999) - (b.priority || 999));
+  return connections;
+}
+
+export async function getProviderNodes(filter = {}) {
+  const db = await getDb();
+  let nodes = db.data.providerNodes || [];
+  if (filter.type) nodes = nodes.filter((node) => node.type === filter.type);
+  return nodes;
+}
+
+export async function getProviderNodeById(id) {
+  const db = await getDb();
+  return db.data.providerNodes.find((node) => node.id === id) || null;
+}
+
+export async function createProviderNode(data) {
+  const db = await getDb();
+  if (!db.data.providerNodes) db.data.providerNodes = [];
+
+  const now = new Date().toISOString();
+  const node = {
+    id: data.id || uuidv4(),
+    type: data.type,
+    name: data.name,
+    prefix: data.prefix,
+    apiType: data.apiType,
+    baseUrl: data.baseUrl,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  db.data.providerNodes.push(node);
+  await safeWrite(db);
+  return node;
+}
+
+export async function updateProviderNode(id, data) {
+  const db = await getDb();
+  if (!db.data.providerNodes) db.data.providerNodes = [];
+
+  const index = db.data.providerNodes.findIndex((node) => node.id === id);
+  if (index === -1) return null;
+
+  db.data.providerNodes[index] = {
+    ...db.data.providerNodes[index],
+    ...data,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await safeWrite(db);
+  return db.data.providerNodes[index];
+}
+
+export async function deleteProviderNode(id) {
+  const db = await getDb();
+  if (!db.data.providerNodes) db.data.providerNodes = [];
+
+  const index = db.data.providerNodes.findIndex((node) => node.id === id);
+  if (index === -1) return null;
+
+  const [removed] = db.data.providerNodes.splice(index, 1);
+  await safeWrite(db);
+  return removed;
+}
+
+export async function getProxyPools(filter = {}) {
+  const db = await getDb();
+  let pools = db.data.proxyPools || [];
+
+  if (filter.isActive !== undefined) pools = pools.filter((pool) => pool.isActive === filter.isActive);
+  if (filter.testStatus) pools = pools.filter((pool) => pool.testStatus === filter.testStatus);
+
+  return pools.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+}
+
+export async function getProxyPoolById(id) {
+  const db = await getDb();
+  return (db.data.proxyPools || []).find((pool) => pool.id === id) || null;
+}
+
+export async function createProxyPool(data) {
+  const db = await getDb();
+  if (!db.data.proxyPools) db.data.proxyPools = [];
+
+  const now = new Date().toISOString();
+  const pool = {
+    id: data.id || uuidv4(),
+    name: data.name,
+    proxyUrl: data.proxyUrl,
+    noProxy: data.noProxy || "",
+    type: data.type || "http",
+    isActive: data.isActive !== undefined ? data.isActive : true,
+    strictProxy: data.strictProxy === true,
+    testStatus: data.testStatus || "unknown",
+    lastTestedAt: data.lastTestedAt || null,
+    lastError: data.lastError || null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  db.data.proxyPools.push(pool);
+  await safeWrite(db);
+  return pool;
+}
+
+export async function updateProxyPool(id, data) {
+  const db = await getDb();
+  if (!db.data.proxyPools) db.data.proxyPools = [];
+
+  const index = db.data.proxyPools.findIndex((pool) => pool.id === id);
+  if (index === -1) return null;
+
+  db.data.proxyPools[index] = {
+    ...db.data.proxyPools[index],
+    ...data,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await safeWrite(db);
+  return db.data.proxyPools[index];
+}
+
+export async function deleteProxyPool(id) {
+  const db = await getDb();
+  if (!db.data.proxyPools) db.data.proxyPools = [];
+
+  const index = db.data.proxyPools.findIndex((pool) => pool.id === id);
+  if (index === -1) return null;
+
+  const [removed] = db.data.proxyPools.splice(index, 1);
+  await safeWrite(db);
+  return removed;
+}
+
+export async function deleteProviderConnectionsByProvider(providerId) {
+  const db = await getDb();
+  const beforeCount = db.data.providerConnections.length;
+  db.data.providerConnections = db.data.providerConnections.filter(
+    (connection) => connection.provider !== providerId
   );
-  return rowsToCamel(rows);
+  const deletedCount = beforeCount - db.data.providerConnections.length;
+  await safeWrite(db);
+  return deletedCount;
 }
 
 export async function getProviderConnectionById(id) {
-  await ensureSchema();
-  const { rows } = await query(`SELECT * FROM provider_connections WHERE id = $1`, [id]);
-  return rows.length ? rowToCamel(rows[0]) : null;
+  const db = await getDb();
+  return db.data.providerConnections.find(c => c.id === id) || null;
 }
 
 export async function createProviderConnection(data) {
-  await ensureSchema();
+  const db = await getDb();
   const now = new Date().toISOString();
 
-  // Upsert check: by provider+email (oauth) or provider+name (apikey)
-  let existing = null;
+  // Upsert: check existing by provider + email (oauth) or provider + name (apikey)
+  let existingIndex = -1;
   if (data.authType === "oauth" && data.email) {
-    const { rows } = await query(
-      `SELECT * FROM provider_connections WHERE provider = $1 AND auth_type = 'oauth' AND email = $2`,
-      [data.provider, data.email]
+    existingIndex = db.data.providerConnections.findIndex(
+      c => c.provider === data.provider && c.authType === "oauth" && c.email === data.email
     );
-    if (rows.length) existing = rows[0];
   } else if (data.authType === "apikey" && data.name) {
-    const { rows } = await query(
-      `SELECT * FROM provider_connections WHERE provider = $1 AND auth_type = 'apikey' AND name = $2`,
-      [data.provider, data.name]
+    existingIndex = db.data.providerConnections.findIndex(
+      c => c.provider === data.provider && c.authType === "apikey" && c.name === data.name
     );
-    if (rows.length) existing = rows[0];
   }
 
-  if (existing) {
-    // Merge update
-    const updates = { ...data, updated_at: now };
-    delete updates.id;
-    const setClauses = [];
-    const params = [];
-    let idx = 1;
-    for (const [key, value] of Object.entries(updates)) {
-      const col = camelToSnake(key);
-      setClauses.push(`${col} = $${idx++}`);
-      params.push(key === "providerSpecificData" ? JSON.stringify(value) : value);
-    }
-    params.push(existing.id);
-    const { rows } = await query(
-      `UPDATE provider_connections SET ${setClauses.join(", ")} WHERE id = $${idx} RETURNING *`,
-      params
-    );
-    return rowToCamel(rows[0]);
+  if (existingIndex !== -1) {
+    db.data.providerConnections[existingIndex] = {
+      ...db.data.providerConnections[existingIndex],
+      ...data,
+      updatedAt: now,
+    };
+    await safeWrite(db);
+    return db.data.providerConnections[existingIndex];
   }
 
-  // Determine name
   let connectionName = data.name || null;
   if (!connectionName && data.authType === "oauth") {
     if (data.email) {
       connectionName = data.email;
     } else {
-      const { rows } = await query(
-        `SELECT COUNT(*) AS cnt FROM provider_connections WHERE provider = $1`,
-        [data.provider]
-      );
-      connectionName = `Account ${parseInt(rows[0].cnt, 10) + 1}`;
+      const existingCount = db.data.providerConnections.filter(
+        c => c.provider === data.provider
+      ).length;
+      connectionName = `Account ${existingCount + 1}`;
     }
   }
 
-  // Determine priority
   let connectionPriority = data.priority;
   if (!connectionPriority) {
-    const { rows } = await query(
-      `SELECT COALESCE(MAX(priority), 0) AS max_p FROM provider_connections WHERE provider = $1`,
-      [data.provider]
-    );
-    connectionPriority = parseInt(rows[0].max_p, 10) + 1;
+    const providerConnections = db.data.providerConnections.filter(c => c.provider === data.provider);
+    const maxPriority = providerConnections.reduce((max, c) => Math.max(max, c.priority || 0), 0);
+    connectionPriority = maxPriority + 1;
   }
 
-  const id = uuidv4();
+  const connection = {
+    id: uuidv4(),
+    provider: data.provider,
+    authType: data.authType || "oauth",
+    name: connectionName,
+    priority: connectionPriority,
+    isActive: data.isActive !== undefined ? data.isActive : true,
+    createdAt: now,
+    updatedAt: now,
+  };
+
   const optionalFields = [
     "displayName", "email", "globalPriority", "defaultModel",
     "accessToken", "refreshToken", "expiresAt", "tokenType",
     "scope", "idToken", "projectId", "apiKey", "testStatus",
     "lastTested", "lastError", "lastErrorAt", "rateLimitedUntil", "expiresIn", "errorCode",
-    "consecutiveUseCount",
+    "consecutiveUseCount"
   ];
-
-  const cols = ["id", "provider", "auth_type", "name", "priority", "is_active", "created_at", "updated_at"];
-  const vals = [id, data.provider, data.authType || "oauth", connectionName, connectionPriority,
-    data.isActive !== undefined ? data.isActive : true, now, now];
 
   for (const field of optionalFields) {
     if (data[field] !== undefined && data[field] !== null) {
-      cols.push(camelToSnake(field));
-      vals.push(data[field]);
+      connection[field] = data[field];
     }
   }
 
   if (data.providerSpecificData && Object.keys(data.providerSpecificData).length > 0) {
-    cols.push("provider_specific_data");
-    vals.push(JSON.stringify(data.providerSpecificData));
+    connection.providerSpecificData = data.providerSpecificData;
   }
 
-  const placeholders = vals.map((_, i) => `$${i + 1}`).join(", ");
-  const { rows } = await query(
-    `INSERT INTO provider_connections (${cols.join(", ")}) VALUES (${placeholders}) RETURNING *`,
-    vals
-  );
-
+  db.data.providerConnections.push(connection);
+  await safeWrite(db);
   await reorderProviderConnections(data.provider);
-  return rowToCamel(rows[0]);
+
+  return connection;
 }
 
 export async function updateProviderConnection(id, data) {
-  await ensureSchema();
+  const db = await getDb();
+  const index = db.data.providerConnections.findIndex(c => c.id === id);
+  if (index === -1) return null;
 
-  // Get current row to know provider for reorder
-  const { rows: current } = await query(`SELECT provider FROM provider_connections WHERE id = $1`, [id]);
-  if (!current.length) return null;
-  const providerId = current[0].provider;
+  const providerId = db.data.providerConnections[index].provider;
 
-  const updates = { ...data, updated_at: new Date().toISOString() };
-  delete updates.id;
+  db.data.providerConnections[index] = {
+    ...db.data.providerConnections[index],
+    ...data,
+    updatedAt: new Date().toISOString(),
+  };
 
-  const setClauses = [];
-  const params = [];
-  let idx = 1;
-  for (const [key, value] of Object.entries(updates)) {
-    const col = camelToSnake(key);
-    setClauses.push(`${col} = $${idx++}`);
-    params.push(key === "providerSpecificData" ? JSON.stringify(value) : value);
-  }
-  params.push(id);
-
-  const { rows } = await query(
-    `UPDATE provider_connections SET ${setClauses.join(", ")} WHERE id = $${idx} RETURNING *`,
-    params
-  );
-  if (!rows.length) return null;
-
+  await safeWrite(db);
   if (data.priority !== undefined) await reorderProviderConnections(providerId);
-  return rowToCamel(rows[0]);
+
+  return db.data.providerConnections[index];
 }
 
 export async function deleteProviderConnection(id) {
-  await ensureSchema();
-  const { rows: current } = await query(`SELECT provider FROM provider_connections WHERE id = $1`, [id]);
-  if (!current.length) return false;
-  const providerId = current[0].provider;
+  const db = await getDb();
+  const index = db.data.providerConnections.findIndex(c => c.id === id);
+  if (index === -1) return false;
 
-  await query(`DELETE FROM provider_connections WHERE id = $1`, [id]);
+  const providerId = db.data.providerConnections[index].provider;
+  db.data.providerConnections.splice(index, 1);
+  await safeWrite(db);
   await reorderProviderConnections(providerId);
+
   return true;
 }
 
-export async function deleteProviderConnectionsByProvider(providerId) {
-  await ensureSchema();
-  const { rowCount } = await query(`DELETE FROM provider_connections WHERE provider = $1`, [providerId]);
-  return rowCount;
-}
-
 export async function reorderProviderConnections(providerId) {
-  await ensureSchema();
-  const { rows } = await query(
-    `SELECT id, priority, updated_at FROM provider_connections WHERE provider = $1 ORDER BY priority ASC NULLS LAST, updated_at DESC`,
-    [providerId]
-  );
-  for (let i = 0; i < rows.length; i++) {
-    const newPriority = i + 1;
-    if (rows[i].priority !== newPriority) {
-      await query(`UPDATE provider_connections SET priority = $1 WHERE id = $2`, [newPriority, rows[i].id]);
-    }
-  }
+  const db = await getDb();
+  if (!db.data.providerConnections) return;
+
+  const providerConnections = db.data.providerConnections
+    .filter(c => c.provider === providerId)
+    .sort((a, b) => {
+      const pDiff = (a.priority || 0) - (b.priority || 0);
+      if (pDiff !== 0) return pDiff;
+      return new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0);
+    });
+
+  providerConnections.forEach((conn, index) => {
+    conn.priority = index + 1;
+  });
+
+  await safeWrite(db);
 }
-
-export async function cleanupProviderConnections() {
-  // Not needed with PG — columns are nullable natively
-  return 0;
-}
-
-// ── Provider Nodes ───────────────────────────────────────────────────
-
-export async function getProviderNodes(filter = {}) {
-  await ensureSchema();
-  const conditions = [];
-  const params = [];
-  let idx = 1;
-
-  if (filter.type) {
-    conditions.push(`type = $${idx++}`);
-    params.push(filter.type);
-  }
-
-  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  const { rows } = await query(`SELECT * FROM provider_nodes ${where}`, params);
-  return rowsToCamel(rows);
-}
-
-export async function getProviderNodeById(id) {
-  await ensureSchema();
-  const { rows } = await query(`SELECT * FROM provider_nodes WHERE id = $1`, [id]);
-  return rows.length ? rowToCamel(rows[0]) : null;
-}
-
-export async function createProviderNode(data) {
-  await ensureSchema();
-  const now = new Date().toISOString();
-  const id = data.id || uuidv4();
-  const { rows } = await query(
-    `INSERT INTO provider_nodes (id, type, name, prefix, api_type, base_url, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-    [id, data.type, data.name, data.prefix, data.apiType, data.baseUrl, now, now]
-  );
-  return rowToCamel(rows[0]);
-}
-
-export async function updateProviderNode(id, data) {
-  await ensureSchema();
-  const updates = { ...data, updated_at: new Date().toISOString() };
-  delete updates.id;
-
-  const setClauses = [];
-  const params = [];
-  let idx = 1;
-  for (const [key, value] of Object.entries(updates)) {
-    setClauses.push(`${camelToSnake(key)} = $${idx++}`);
-    params.push(value);
-  }
-  params.push(id);
-
-  const { rows } = await query(
-    `UPDATE provider_nodes SET ${setClauses.join(", ")} WHERE id = $${idx} RETURNING *`,
-    params
-  );
-  return rows.length ? rowToCamel(rows[0]) : null;
-}
-
-export async function deleteProviderNode(id) {
-  await ensureSchema();
-  const { rows } = await query(`DELETE FROM provider_nodes WHERE id = $1 RETURNING *`, [id]);
-  return rows.length ? rowToCamel(rows[0]) : null;
-}
-
-// ── Proxy Pools ──────────────────────────────────────────────────────
-
-export async function getProxyPools(filter = {}) {
-  await ensureSchema();
-  const conditions = [];
-  const params = [];
-  let idx = 1;
-
-  if (filter.isActive !== undefined) {
-    conditions.push(`is_active = $${idx++}`);
-    params.push(filter.isActive);
-  }
-  if (filter.testStatus) {
-    conditions.push(`test_status = $${idx++}`);
-    params.push(filter.testStatus);
-  }
-
-  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  const { rows } = await query(
-    `SELECT * FROM proxy_pools ${where} ORDER BY updated_at DESC NULLS LAST`,
-    params
-  );
-  return rowsToCamel(rows);
-}
-
-export async function getProxyPoolById(id) {
-  await ensureSchema();
-  const { rows } = await query(`SELECT * FROM proxy_pools WHERE id = $1`, [id]);
-  return rows.length ? rowToCamel(rows[0]) : null;
-}
-
-export async function createProxyPool(data) {
-  await ensureSchema();
-  const now = new Date().toISOString();
-  const id = data.id || uuidv4();
-  const { rows } = await query(
-    `INSERT INTO proxy_pools (id, name, proxy_url, no_proxy, type, is_active, strict_proxy, test_status, last_tested_at, last_error, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
-    [
-      id,
-      data.name,
-      data.proxyUrl,
-      data.noProxy || "",
-      data.type || "http",
-      data.isActive !== undefined ? data.isActive : true,
-      data.strictProxy === true,
-      data.testStatus || "unknown",
-      data.lastTestedAt || null,
-      data.lastError || null,
-      now,
-      now,
-    ]
-  );
-  return rowToCamel(rows[0]);
-}
-
-export async function updateProxyPool(id, data) {
-  await ensureSchema();
-  const updates = { ...data, updated_at: new Date().toISOString() };
-  delete updates.id;
-
-  const setClauses = [];
-  const params = [];
-  let idx = 1;
-  for (const [key, value] of Object.entries(updates)) {
-    setClauses.push(`${camelToSnake(key)} = $${idx++}`);
-    params.push(value);
-  }
-  params.push(id);
-
-  const { rows } = await query(
-    `UPDATE proxy_pools SET ${setClauses.join(", ")} WHERE id = $${idx} RETURNING *`,
-    params
-  );
-  return rows.length ? rowToCamel(rows[0]) : null;
-}
-
-export async function deleteProxyPool(id) {
-  await ensureSchema();
-  const { rows } = await query(`DELETE FROM proxy_pools WHERE id = $1 RETURNING *`, [id]);
-  return rows.length ? rowToCamel(rows[0]) : null;
-}
-
-// ── Model Aliases ────────────────────────────────────────────────────
 
 export async function getModelAliases() {
-  await ensureSchema();
-  const { rows } = await query(`SELECT alias, model FROM model_aliases`);
-  const out = {};
-  for (const r of rows) out[r.alias] = r.model;
-  return out;
+  const db = await getDb();
+  return db.data.modelAliases || {};
 }
 
 export async function setModelAlias(alias, model) {
-  await ensureSchema();
-  await query(
-    `INSERT INTO model_aliases (alias, model) VALUES ($1, $2)
-     ON CONFLICT (alias) DO UPDATE SET model = EXCLUDED.model`,
-    [alias, model]
-  );
+  const db = await getDb();
+  db.data.modelAliases[alias] = model;
+  await safeWrite(db);
 }
 
 export async function deleteModelAlias(alias) {
-  await ensureSchema();
-  await query(`DELETE FROM model_aliases WHERE alias = $1`, [alias]);
+  const db = await getDb();
+  delete db.data.modelAliases[alias];
+  await safeWrite(db);
 }
 
-// ── MITM Aliases ─────────────────────────────────────────────────────
-
 export async function getMitmAlias(toolName) {
-  await ensureSchema();
-  if (toolName) {
-    const { rows } = await query(`SELECT mappings FROM mitm_aliases WHERE tool_name = $1`, [toolName]);
-    return rows.length ? rows[0].mappings : {};
-  }
-  const { rows } = await query(`SELECT tool_name, mappings FROM mitm_aliases`);
-  const out = {};
-  for (const r of rows) out[r.tool_name] = r.mappings;
-  return out;
+  const db = await getDb();
+  const all = db.data.mitmAlias || {};
+  if (toolName) return all[toolName] || {};
+  return all;
 }
 
 export async function setMitmAliasAll(toolName, mappings) {
-  await ensureSchema();
-  await query(
-    `INSERT INTO mitm_aliases (tool_name, mappings) VALUES ($1, $2)
-     ON CONFLICT (tool_name) DO UPDATE SET mappings = EXCLUDED.mappings`,
-    [toolName, JSON.stringify(mappings || {})]
-  );
+  const db = await getDb();
+  if (!db.data.mitmAlias) db.data.mitmAlias = {};
+  db.data.mitmAlias[toolName] = mappings || {};
+  await safeWrite(db);
 }
 
-// ── Combos ───────────────────────────────────────────────────────────
-
 export async function getCombos() {
-  await ensureSchema();
-  const { rows } = await query(`SELECT * FROM combos ORDER BY created_at`);
-  return rowsToCamel(rows);
+  const db = await getDb();
+  return db.data.combos || [];
 }
 
 export async function getComboById(id) {
-  await ensureSchema();
-  const { rows } = await query(`SELECT * FROM combos WHERE id = $1`, [id]);
-  return rows.length ? rowToCamel(rows[0]) : null;
+  const db = await getDb();
+  return (db.data.combos || []).find(c => c.id === id) || null;
 }
 
 export async function getComboByName(name) {
-  await ensureSchema();
-  const { rows } = await query(`SELECT * FROM combos WHERE name = $1`, [name]);
-  return rows.length ? rowToCamel(rows[0]) : null;
+  const db = await getDb();
+  return (db.data.combos || []).find(c => c.name === name) || null;
 }
 
 export async function createCombo(data) {
-  await ensureSchema();
+  const db = await getDb();
+  if (!db.data.combos) db.data.combos = [];
+
   const now = new Date().toISOString();
-  const id = uuidv4();
-  const { rows } = await query(
-    `INSERT INTO combos (id, name, models, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-    [id, data.name, JSON.stringify(data.models || []), now, now]
-  );
-  return rowToCamel(rows[0]);
+  const combo = {
+    id: uuidv4(),
+    name: data.name,
+    models: data.models || [],
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  db.data.combos.push(combo);
+  await safeWrite(db);
+  return combo;
 }
 
 export async function updateCombo(id, data) {
-  await ensureSchema();
-  const updates = { ...data, updated_at: new Date().toISOString() };
-  delete updates.id;
+  const db = await getDb();
+  if (!db.data.combos) db.data.combos = [];
 
-  const setClauses = [];
-  const params = [];
-  let idx = 1;
-  for (const [key, value] of Object.entries(updates)) {
-    const col = camelToSnake(key);
-    setClauses.push(`${col} = $${idx++}`);
-    params.push(key === "models" ? JSON.stringify(value) : value);
-  }
-  params.push(id);
+  const index = db.data.combos.findIndex(c => c.id === id);
+  if (index === -1) return null;
 
-  const { rows } = await query(
-    `UPDATE combos SET ${setClauses.join(", ")} WHERE id = $${idx} RETURNING *`,
-    params
-  );
-  return rows.length ? rowToCamel(rows[0]) : null;
+  db.data.combos[index] = {
+    ...db.data.combos[index],
+    ...data,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await safeWrite(db);
+  return db.data.combos[index];
 }
 
 export async function deleteCombo(id) {
-  await ensureSchema();
-  const { rowCount } = await query(`DELETE FROM combos WHERE id = $1`, [id]);
-  return rowCount > 0;
+  const db = await getDb();
+  if (!db.data.combos) return false;
+
+  const index = db.data.combos.findIndex(c => c.id === id);
+  if (index === -1) return false;
+
+  db.data.combos.splice(index, 1);
+  await safeWrite(db);
+  return true;
 }
 
-// ── API Keys ─────────────────────────────────────────────────────────
-
 export async function getApiKeys() {
-  await ensureSchema();
-  const { rows } = await query(`SELECT * FROM api_keys ORDER BY created_at`);
-  return rowsToCamel(rows);
+  const db = await getDb();
+  return db.data.apiKeys || [];
+}
+
+function generateShortKey() {
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let result = "";
+  for (let i = 0; i < 8; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
 }
 
 export async function createApiKey(name, machineId) {
   if (!machineId) throw new Error("machineId is required");
-  await ensureSchema();
+
+  const db = await getDb();
+  const now = new Date().toISOString();
 
   const { generateApiKeyWithMachine } = await import("@/shared/utils/apiKey");
   const result = generateApiKeyWithMachine(machineId);
 
-  const now = new Date().toISOString();
-  const id = uuidv4();
-  const { rows } = await query(
-    `INSERT INTO api_keys (id, name, key, machine_id, is_active, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-    [id, name, result.key, machineId, true, now]
-  );
-  return rowToCamel(rows[0]);
+  const apiKey = {
+    id: uuidv4(),
+    name: name,
+    key: result.key,
+    machineId: machineId,
+    isActive: true,
+    createdAt: now,
+  };
+
+  db.data.apiKeys.push(apiKey);
+  await safeWrite(db);
+  return apiKey;
 }
 
 export async function deleteApiKey(id) {
-  await ensureSchema();
-  const { rowCount } = await query(`DELETE FROM api_keys WHERE id = $1`, [id]);
-  return rowCount > 0;
+  const db = await getDb();
+  const index = db.data.apiKeys.findIndex(k => k.id === id);
+  if (index === -1) return false;
+
+  db.data.apiKeys.splice(index, 1);
+  await safeWrite(db);
+  return true;
 }
 
 export async function getApiKeyById(id) {
-  await ensureSchema();
-  const { rows } = await query(`SELECT * FROM api_keys WHERE id = $1`, [id]);
-  return rows.length ? rowToCamel(rows[0]) : null;
+  const db = await getDb();
+  return db.data.apiKeys.find(k => k.id === id) || null;
 }
 
 export async function updateApiKey(id, data) {
-  await ensureSchema();
-  const setClauses = [];
-  const params = [];
-  let idx = 1;
-  for (const [key, value] of Object.entries(data)) {
-    setClauses.push(`${camelToSnake(key)} = $${idx++}`);
-    params.push(value);
-  }
-  if (!setClauses.length) return null;
-  params.push(id);
-
-  const { rows } = await query(
-    `UPDATE api_keys SET ${setClauses.join(", ")} WHERE id = $${idx} RETURNING *`,
-    params
-  );
-  return rows.length ? rowToCamel(rows[0]) : null;
+  const db = await getDb();
+  const index = db.data.apiKeys.findIndex(k => k.id === id);
+  if (index === -1) return null;
+  db.data.apiKeys[index] = { ...db.data.apiKeys[index], ...data };
+  await safeWrite(db);
+  return db.data.apiKeys[index];
 }
 
 export async function validateApiKey(key) {
-  await ensureSchema();
-  const { rows } = await query(`SELECT is_active FROM api_keys WHERE key = $1`, [key]);
-  return rows.length > 0 && rows[0].is_active !== false;
+  const db = await getDb();
+  const found = db.data.apiKeys.find(k => k.key === key);
+  return found && found.isActive !== false;
 }
 
-// ── Settings ─────────────────────────────────────────────────────────
+export async function cleanupProviderConnections() {
+  const db = await getDb();
+  const fieldsToCheck = [
+    "displayName", "email", "globalPriority", "defaultModel",
+    "accessToken", "refreshToken", "expiresAt", "tokenType",
+    "scope", "idToken", "projectId", "apiKey", "testStatus",
+    "lastTested", "lastError", "lastErrorAt", "rateLimitedUntil", "expiresIn",
+    "consecutiveUseCount"
+  ];
+
+  let cleaned = 0;
+  for (const connection of db.data.providerConnections) {
+    for (const field of fieldsToCheck) {
+      if (connection[field] === null || connection[field] === undefined) {
+        delete connection[field];
+        cleaned++;
+      }
+    }
+    if (connection.providerSpecificData && Object.keys(connection.providerSpecificData).length === 0) {
+      delete connection.providerSpecificData;
+      cleaned++;
+    }
+  }
+
+  if (cleaned > 0) await safeWrite(db);
+  return cleaned;
+}
 
 export async function getSettings() {
-  await ensureSchema();
-  const { rows } = await query(`SELECT key, value FROM settings`);
-  const stored = {};
-  for (const r of rows) {
-    stored[r.key] = r.value;
-  }
-  return { ...DEFAULT_SETTINGS, ...stored };
+  const db = await getDb();
+  return db.data.settings || { cloudEnabled: false };
 }
 
 export async function updateSettings(updates) {
-  await ensureSchema();
-  for (const [key, value] of Object.entries(updates)) {
-    await query(
-      `INSERT INTO settings (key, value) VALUES ($1, $2)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      [key, JSON.stringify(value)]
-    );
-  }
-  return getSettings();
+  const db = await getDb();
+  db.data.settings = { ...db.data.settings, ...updates };
+  await safeWrite(db);
+  return db.data.settings;
 }
 
-// ── Export / Import ──────────────────────────────────────────────────
-
 export async function exportDb() {
-  await ensureSchema();
-  const [
-    providerConnections,
-    providerNodes,
-    proxyPools,
-    modelAliases,
-    mitmAlias,
-    combos,
-    apiKeys,
-    settings,
-    pricing,
-  ] = await Promise.all([
-    getProviderConnections(),
-    getProviderNodes(),
-    getProxyPools(),
-    getModelAliases(),
-    getMitmAlias(),
-    getCombos(),
-    getApiKeys(),
-    getSettings(),
-    getPricing(),
-  ]);
-
-  return {
-    providerConnections,
-    providerNodes,
-    proxyPools,
-    modelAliases,
-    mitmAlias,
-    combos,
-    apiKeys,
-    settings,
-    pricing,
-  };
+  const db = await getDb();
+  return db.data || cloneDefaultData();
 }
 
 export async function importDb(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Invalid database payload");
   }
-  await ensureSchema();
 
-  const client = await getClient();
-  try {
-    await client.query("BEGIN");
+  const nextData = {
+    ...cloneDefaultData(),
+    ...payload,
+    settings: {
+      ...cloneDefaultData().settings,
+      ...(payload.settings && typeof payload.settings === "object" && !Array.isArray(payload.settings)
+        ? payload.settings
+        : {}),
+    },
+  };
 
-    // Clear all tables
-    await client.query("DELETE FROM provider_connections");
-    await client.query("DELETE FROM provider_nodes");
-    await client.query("DELETE FROM proxy_pools");
-    await client.query("DELETE FROM model_aliases");
-    await client.query("DELETE FROM mitm_aliases");
-    await client.query("DELETE FROM combos");
-    await client.query("DELETE FROM api_keys");
-    await client.query("DELETE FROM settings");
-    await client.query("DELETE FROM pricing");
-
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
-  }
-
-  // Re-insert data using the public functions (they handle camel→snake)
-  if (Array.isArray(payload.providerConnections)) {
-    for (const c of payload.providerConnections) {
-      await createProviderConnection(c);
-    }
-  }
-  if (Array.isArray(payload.providerNodes)) {
-    for (const n of payload.providerNodes) {
-      await createProviderNode(n);
-    }
-  }
-  if (Array.isArray(payload.proxyPools)) {
-    for (const p of payload.proxyPools) {
-      await createProxyPool(p);
-    }
-  }
-  if (payload.modelAliases && typeof payload.modelAliases === "object") {
-    for (const [alias, model] of Object.entries(payload.modelAliases)) {
-      await setModelAlias(alias, model);
-    }
-  }
-  if (payload.mitmAlias && typeof payload.mitmAlias === "object") {
-    for (const [toolName, mappings] of Object.entries(payload.mitmAlias)) {
-      await setMitmAliasAll(toolName, mappings);
-    }
-  }
-  if (Array.isArray(payload.combos)) {
-    for (const c of payload.combos) {
-      await createCombo(c);
-    }
-  }
-  if (Array.isArray(payload.apiKeys)) {
-    for (const k of payload.apiKeys) {
-      // Direct insert for imported keys (they already have key field)
-      const now = new Date().toISOString();
-      await query(
-        `INSERT INTO api_keys (id, name, key, machine_id, is_active, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [k.id || uuidv4(), k.name, k.key, k.machineId || k.machine_id, k.isActive !== false, k.createdAt || now]
-      );
-    }
-  }
-  if (payload.settings && typeof payload.settings === "object" && !Array.isArray(payload.settings)) {
-    const merged = { ...DEFAULT_SETTINGS, ...payload.settings };
-    await updateSettings(merged);
-  }
-  if (payload.pricing && typeof payload.pricing === "object") {
-    await updatePricing(payload.pricing);
-  }
-
-  return exportDb();
+  const { data: normalized } = ensureDbShape(nextData);
+  const db = await getDb();
+  db.data = normalized;
+  await safeWrite(db);
+  return db.data;
 }
-
-// ── Cloud helpers ────────────────────────────────────────────────────
 
 export async function isCloudEnabled() {
   const settings = await getSettings();
@@ -740,18 +756,11 @@ export async function getCloudUrl() {
   return settings.cloudUrl || process.env.CLOUD_URL || process.env.NEXT_PUBLIC_CLOUD_URL || "";
 }
 
-// ── Pricing ──────────────────────────────────────────────────────────
-
 export async function getPricing() {
-  await ensureSchema();
-  const { rows } = await query(`SELECT provider, model, pricing_data FROM pricing`);
-  const userPricing = {};
-  for (const r of rows) {
-    if (!userPricing[r.provider]) userPricing[r.provider] = {};
-    userPricing[r.provider][r.model] = r.pricing_data;
-  }
-
+  const db = await getDb();
+  const userPricing = db.data.pricing || {};
   const { PROVIDER_PRICING } = await import("@/shared/constants/pricing.js");
+
   const merged = {};
 
   for (const [provider, models] of Object.entries(PROVIDER_PRICING)) {
@@ -780,14 +789,12 @@ export async function getPricing() {
 
 export async function getPricingForModel(provider, model) {
   if (!model) return null;
-  await ensureSchema();
 
-  if (provider) {
-    const { rows } = await query(
-      `SELECT pricing_data FROM pricing WHERE provider = $1 AND model = $2`,
-      [provider, model]
-    );
-    if (rows.length) return rows[0].pricing_data;
+  const db = await getDb();
+  const userPricing = db.data.pricing || {};
+
+  if (provider && userPricing[provider]?.[model]) {
+    return userPricing[provider][model];
   }
 
   const { getPricingForModel: resolve } = await import("@/shared/constants/pricing.js");
@@ -795,45 +802,42 @@ export async function getPricingForModel(provider, model) {
 }
 
 export async function updatePricing(pricingData) {
-  await ensureSchema();
+  const db = await getDb();
+  if (!db.data.pricing) db.data.pricing = {};
+
   for (const [provider, models] of Object.entries(pricingData)) {
+    if (!db.data.pricing[provider]) db.data.pricing[provider] = {};
     for (const [model, pricing] of Object.entries(models)) {
-      await query(
-        `INSERT INTO pricing (provider, model, pricing_data) VALUES ($1, $2, $3)
-         ON CONFLICT (provider, model) DO UPDATE SET pricing_data = EXCLUDED.pricing_data`,
-        [provider, model, JSON.stringify(pricing)]
-      );
+      db.data.pricing[provider][model] = pricing;
     }
   }
-  // Return only user-stored pricing
-  const { rows } = await query(`SELECT provider, model, pricing_data FROM pricing`);
-  const out = {};
-  for (const r of rows) {
-    if (!out[r.provider]) out[r.provider] = {};
-    out[r.provider][r.model] = r.pricing_data;
-  }
-  return out;
+
+  await safeWrite(db);
+  return db.data.pricing;
 }
 
 export async function resetPricing(provider, model) {
-  await ensureSchema();
+  const db = await getDb();
+  if (!db.data.pricing) db.data.pricing = {};
+
   if (model) {
-    await query(`DELETE FROM pricing WHERE provider = $1 AND model = $2`, [provider, model]);
+    if (db.data.pricing[provider]) {
+      delete db.data.pricing[provider][model];
+      if (Object.keys(db.data.pricing[provider]).length === 0) {
+        delete db.data.pricing[provider];
+      }
+    }
   } else {
-    await query(`DELETE FROM pricing WHERE provider = $1`, [provider]);
+    delete db.data.pricing[provider];
   }
-  // Return remaining user pricing
-  const { rows } = await query(`SELECT provider, model, pricing_data FROM pricing`);
-  const out = {};
-  for (const r of rows) {
-    if (!out[r.provider]) out[r.provider] = {};
-    out[r.provider][r.model] = r.pricing_data;
-  }
-  return out;
+
+  await safeWrite(db);
+  return db.data.pricing;
 }
 
 export async function resetAllPricing() {
-  await ensureSchema();
-  await query(`DELETE FROM pricing`);
-  return {};
+  const db = await getDb();
+  db.data.pricing = {};
+  await safeWrite(db);
+  return db.data.pricing;
 }
