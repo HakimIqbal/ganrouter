@@ -159,3 +159,81 @@ CREATE TABLE IF NOT EXISTS counters (
   value BIGINT DEFAULT 0
 );
 INSERT INTO counters (name, value) VALUES ('total_requests_lifetime', 0) ON CONFLICT DO NOTHING;
+
+-- ============================================================
+-- GaN-SPECIFIC: Projects + Agent Routing
+-- ============================================================
+
+-- Projects — multi-project isolation
+CREATE TABLE IF NOT EXISTS projects (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(255) UNIQUE NOT NULL,
+  description TEXT,
+  api_key_prefix VARCHAR(50),
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+INSERT INTO projects (name, description, api_key_prefix) VALUES ('gan', 'GaN — Governing Autonomous Navigator', 'gan') ON CONFLICT DO NOTHING;
+
+-- Agent routing configs — per-agent model tiering
+CREATE TABLE IF NOT EXISTS agent_configs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+  agent_name VARCHAR(100) NOT NULL,
+  agent_role VARCHAR(100),
+  combo_name VARCHAR(255),
+  daily_token_budget INTEGER,
+  tokens_used_today INTEGER DEFAULT 0,
+  budget_reset_at DATE DEFAULT CURRENT_DATE,
+  is_active BOOLEAN DEFAULT true,
+  metadata JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(project_id, agent_name)
+);
+
+-- Agent usage tracking — per-agent cost/token analytics
+CREATE TABLE IF NOT EXISTS agent_usage (
+  id BIGSERIAL PRIMARY KEY,
+  project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+  agent_name VARCHAR(100) NOT NULL,
+  timestamp TIMESTAMPTZ DEFAULT NOW(),
+  model VARCHAR(255),
+  provider VARCHAR(100),
+  prompt_tokens INTEGER DEFAULT 0,
+  completion_tokens INTEGER DEFAULT 0,
+  cost DOUBLE PRECISION DEFAULT 0,
+  combo_used VARCHAR(255),
+  fallback_level INTEGER DEFAULT 0
+);
+
+-- Agent daily summary
+CREATE TABLE IF NOT EXISTS agent_daily_summary (
+  date DATE NOT NULL,
+  project_id UUID NOT NULL,
+  agent_name VARCHAR(100) NOT NULL,
+  requests INTEGER DEFAULT 0,
+  prompt_tokens BIGINT DEFAULT 0,
+  completion_tokens BIGINT DEFAULT 0,
+  cost DOUBLE PRECISION DEFAULT 0,
+  fallbacks INTEGER DEFAULT 0,
+  PRIMARY KEY (date, project_id, agent_name)
+);
+
+-- Project-level API keys — isolated per project
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS project_id UUID REFERENCES projects(id);
+
+-- Add agent_name + project_id to usage_history for tracking
+ALTER TABLE usage_history ADD COLUMN IF NOT EXISTS agent_name VARCHAR(100);
+ALTER TABLE usage_history ADD COLUMN IF NOT EXISTS project_id UUID;
+
+-- Indexes for new tables
+CREATE INDEX IF NOT EXISTS idx_agent_configs_project ON agent_configs(project_id);
+CREATE INDEX IF NOT EXISTS idx_agent_configs_name ON agent_configs(agent_name);
+CREATE INDEX IF NOT EXISTS idx_agent_usage_project ON agent_usage(project_id);
+CREATE INDEX IF NOT EXISTS idx_agent_usage_agent ON agent_usage(agent_name);
+CREATE INDEX IF NOT EXISTS idx_agent_usage_timestamp ON agent_usage(timestamp);
+CREATE INDEX IF NOT EXISTS idx_agent_daily_date ON agent_daily_summary(date);
+CREATE INDEX IF NOT EXISTS idx_usage_history_agent ON usage_history(agent_name);
+CREATE INDEX IF NOT EXISTS idx_usage_history_project ON usage_history(project_id);
